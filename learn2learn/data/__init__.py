@@ -1,3 +1,9 @@
 #!/usr/bin/env python3
 
-from .task_generator import TaskGenerator, MetaDataset
+r"""
+A set of utilities for data & tasks loading, preprocessing, and sampling.
+"""
+
+from . import transforms
+from .meta_dataset import MetaDataset
+from .task_dataset import TaskDataset, DataDescription

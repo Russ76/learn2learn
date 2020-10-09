@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
+import traceback
 from torch.autograd import grad
 
 from learn2learn.algorithms.base_learner import BaseLearner
-from learn2learn.utils import clone_module
+from learn2learn.utils import clone_module, update_module
 
 
 def maml_update(model, lr, grads=None):
     """
+    [[Source]](https://github.com/learnables/learn2learn/blob/master/learn2learn/algorithms/maml.py)
 
     **Description**
 
@@ -40,38 +42,20 @@ def maml_update(model, lr, grads=None):
             msg += str(len(params)) + ' vs ' + str(len(grads)) + ')'
             print(msg)
         for p, g in zip(params, grads):
-            p.grad = g
-
-    # Update the params
-    for param_key in model._parameters:
-        p = model._parameters[param_key]
-        if p is not None and p.grad is not None:
-            model._parameters[param_key] = p - lr * p.grad
-
-    # Second, handle the buffers if necessary
-    for buffer_key in model._buffers:
-        buff = model._buffers[buffer_key]
-        if buff is not None and buff.grad is not None:
-            model._buffers[buffer_key] = buff - lr * buff.grad
-
-    # Then, recurse for each submodule
-    for module_key in model._modules:
-        model._modules[module_key] = maml_update(model._modules[module_key],
-                                                 lr=lr,
-                                                 grads=None)
-    return model
+            if g is not None:
+                p.update = - lr * g
+    return update_module(model)
 
 
 class MAML(BaseLearner):
     """
-
     [[Source]](https://github.com/learnables/learn2learn/blob/master/learn2learn/algorithms/maml.py)
 
     **Description**
 
     High-level implementation of *Model-Agnostic Meta-Learning*.
 
-    This class wraps an arbitrary nn.Module and augments it with `clone()` and `adapt`
+    This class wraps an arbitrary nn.Module and augments it with `clone()` and `adapt()`
     methods.
 
     For the first-order version of MAML (i.e. FOMAML), set the `first_order` flag to `True`
@@ -81,11 +65,16 @@ class MAML(BaseLearner):
 
     * **model** (Module) - Module to be wrapped.
     * **lr** (float) - Fast adaptation learning rate.
-    * **first_order** (bool, *optional*, default=False) - Whether to use the
+    * **first_order** (bool, *optional*, default=False) - Whether to use the first-order
+        approximation of MAML. (FOMAML)
+    * **allow_unused** (bool, *optional*, default=None) - Whether to allow differentiation
+        of unused parameters. Defaults to `allow_nograd`.
+    * **allow_nograd** (bool, *optional*, default=False) - Whether to allow adaptation with
+        parameters that have `requires_grad = False`.
 
     **References**
 
-    1. Finn et al. 2017. “Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks.”
+    1. Finn et al. 2017. "Model-Agnostic Meta-Learning for Fast Adaptation of Deep Networks."
 
     **Example**
 
@@ -99,38 +88,87 @@ class MAML(BaseLearner):
     ~~~
     """
 
-    def __init__(self, model, lr, first_order=False):
+    def __init__(self,
+                 model,
+                 lr,
+                 first_order=False,
+                 allow_unused=None,
+                 allow_nograd=False):
         super(MAML, self).__init__()
         self.module = model
         self.lr = lr
         self.first_order = first_order
+        self.allow_nograd = allow_nograd
+        if allow_unused is None:
+            allow_unused = allow_nograd
+        self.allow_unused = allow_unused
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
 
-    def adapt(self, loss, first_order=None):
+    def adapt(self,
+              loss,
+              first_order=None,
+              allow_unused=None,
+              allow_nograd=None):
         """
         **Description**
 
-        Updates the clone parameters in place using the MAML update.
+        Takes a gradient step on the loss and updates the cloned parameters in place.
 
         **Arguments**
 
         * **loss** (Tensor) - Loss to minimize upon update.
         * **first_order** (bool, *optional*, default=None) - Whether to use first- or
             second-order updates. Defaults to self.first_order.
+        * **allow_unused** (bool, *optional*, default=None) - Whether to allow differentiation
+            of unused parameters. Defaults to self.allow_unused.
+        * **allow_nograd** (bool, *optional*, default=None) - Whether to allow adaptation with
+            parameters that have `requires_grad = False`. Defaults to self.allow_nograd.
 
         """
         if first_order is None:
             first_order = self.first_order
+        if allow_unused is None:
+            allow_unused = self.allow_unused
+        if allow_nograd is None:
+            allow_nograd = self.allow_nograd
         second_order = not first_order
-        gradients = grad(loss,
-                         self.module.parameters(),
-                         retain_graph=second_order,
-                         create_graph=second_order)
+
+        if allow_nograd:
+            # Compute relevant gradients
+            diff_params = [p for p in self.module.parameters() if p.requires_grad]
+            grad_params = grad(loss,
+                               diff_params,
+                               retain_graph=second_order,
+                               create_graph=second_order,
+                               allow_unused=allow_unused)
+            gradients = []
+            grad_counter = 0
+
+            # Handles gradients for non-differentiable parameters
+            for param in self.module.parameters():
+                if param.requires_grad:
+                    gradient = grad_params[grad_counter]
+                    grad_counter += 1
+                else:
+                    gradient = None
+                gradients.append(gradient)
+        else:
+            try:
+                gradients = grad(loss,
+                                 self.module.parameters(),
+                                 retain_graph=second_order,
+                                 create_graph=second_order,
+                                 allow_unused=allow_unused)
+            except RuntimeError:
+                traceback.print_exc()
+                print('learn2learn: Maybe try with allow_nograd=True and/or allow_unused=True ?')
+
+        # Update the module
         self.module = maml_update(self.module, self.lr, gradients)
 
-    def clone(self, first_order=None):
+    def clone(self, first_order=None, allow_unused=None, allow_nograd=None):
         """
         **Description**
 
@@ -145,10 +183,20 @@ class MAML(BaseLearner):
 
         * **first_order** (bool, *optional*, default=None) - Whether the clone uses first-
             or second-order updates. Defaults to self.first_order.
+        * **allow_unused** (bool, *optional*, default=None) - Whether to allow differentiation
+        of unused parameters. Defaults to self.allow_unused.
+        * **allow_nograd** (bool, *optional*, default=False) - Whether to allow adaptation with
+            parameters that have `requires_grad = False`. Defaults to self.allow_nograd.
 
         """
         if first_order is None:
             first_order = self.first_order
+        if allow_unused is None:
+            allow_unused = self.allow_unused
+        if allow_nograd is None:
+            allow_nograd = self.allow_nograd
         return MAML(clone_module(self.module),
                     lr=self.lr,
-                    first_order=first_order)
+                    first_order=first_order,
+                    allow_unused=allow_unused,
+                    allow_nograd=allow_nograd)
